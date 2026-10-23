@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -415,6 +416,129 @@ func TestAgentsPromptResumesPausedSession(t *testing.T) {
 
 		config.Args = []string{testPromptSessionID, "hi"}
 		require.NoError(t, RunAgentsPrompt(config))
+	})
+}
+
+// narratedRun is a two-message turn: narration, a tool call, then the answer.
+func narratedRun(command string) string {
+	args, _ := json.Marshal(map[string]any{"command": command})
+	return promptTokenFrame("evt-1", testPromptRunID, "I'll check the files first.", false) +
+		promptFrame("evt-2", testPromptRunID, godo.HostedAgentEventKindToolCallStarted,
+			fmt.Sprintf(`{"tool_call_id":"t1","name":"bash","arguments":%s}`, args)) +
+		promptTokenFrame("evt-3", testPromptRunID, "The answer is Paris.", false) +
+		promptFrame("evt-4", testPromptRunID, godo.HostedAgentEventKindRunCompleted,
+			`{"total_tokens_in":12,"total_tokens_out":3}`)
+}
+
+// Narration is written as each message ends, so on a terminal it reads in
+// order with the tool calls between messages rather than in one block at the
+// end, and the messages stay separate paragraphs instead of running together.
+func TestAgentsPromptStreamsMessagesInOrderWithToolCalls(t *testing.T) {
+	withTestClient(t, func(config *CmdConfig, tm *tcMocks) {
+		var both bytes.Buffer
+		capturePrompt(t, config)
+		config.Out = &both
+		promptStderr = &both
+		promptStream(t, tm, narratedRun("ls"))
+		expectSendInput(tm, "")
+
+		config.Args = []string{testPromptSessionID, "hi"}
+		require.NoError(t, RunAgentsPrompt(config))
+
+		got := both.String()
+		narration := strings.Index(got, "I'll check the files first.\n")
+		tool := strings.Index(got, "· ls\n")
+		answer := strings.Index(got, "\nThe answer is Paris.\n")
+		require.True(t, narration >= 0 && tool >= 0 && answer >= 0, "missing output in %q", got)
+		assert.Less(t, narration, tool, "narration before the tool call it led to")
+		assert.Less(t, tool, answer, "the answer after the tool call")
+	})
+}
+
+// stdout alone is still exactly the answer text, one paragraph per message.
+func TestAgentsPromptStdoutSeparatesMessages(t *testing.T) {
+	withTestClient(t, func(config *CmdConfig, tm *tcMocks) {
+		stdout, _, _ := capturePrompt(t, config)
+		promptStream(t, tm, narratedRun("ls"))
+		expectSendInput(tm, "")
+
+		config.Args = []string{testPromptSessionID, "hi"}
+		require.NoError(t, RunAgentsPrompt(config))
+
+		assert.Equal(t, "I'll check the files first.\n\nThe answer is Paris.\n", stdout.String())
+	})
+}
+
+// A tool call before the first message still leaves a blank line above that
+// message on a terminal, but the blank line goes to stderr so stdout starts
+// with the answer.
+func TestAgentsPromptBlankLineAfterLeadingToolCall(t *testing.T) {
+	for name, frames := range map[string]string{
+		"narration then answer": promptFrame("evt-0", testPromptRunID, godo.HostedAgentEventKindToolCallStarted,
+			`{"tool_call_id":"t0","name":"bash","arguments":{"command":"pwd"}}`) + narratedRun("ls"),
+		"answer only": promptFrame("evt-0", testPromptRunID, godo.HostedAgentEventKindToolCallStarted,
+			`{"tool_call_id":"t0","name":"bash","arguments":{"command":"pwd"}}`) +
+			promptTokenFrame("evt-1", testPromptRunID, "The answer is Paris.", false) +
+			promptFrame("evt-2", testPromptRunID, godo.HostedAgentEventKindRunCompleted,
+				`{"total_tokens_in":12,"total_tokens_out":3}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			withTestClient(t, func(config *CmdConfig, tm *tcMocks) {
+				var both bytes.Buffer
+				stdout, _, _ := capturePrompt(t, config)
+				promptStderr = &both
+				config.Out = io.MultiWriter(stdout, &both)
+				promptStream(t, tm, frames)
+				expectSendInput(tm, "")
+
+				config.Args = []string{testPromptSessionID, "hi"}
+				require.NoError(t, RunAgentsPrompt(config))
+
+				assert.Contains(t, both.String(), "· pwd\n\n", "blank line after the leading tool call")
+				assert.False(t, strings.HasPrefix(stdout.String(), "\n"), "stdout starts with the answer: %q", stdout.String())
+			})
+		})
+	}
+}
+
+func TestAgentsPromptJSONSeparatesMessages(t *testing.T) {
+	withTestClient(t, func(config *CmdConfig, tm *tcMocks) {
+		stdout, _, _ := capturePrompt(t, config)
+		promptStream(t, tm, narratedRun("ls"))
+		expectSendInput(tm, "")
+
+		prev := Output
+		Output = "json"
+		t.Cleanup(func() { Output = prev })
+
+		config.Args = []string{testPromptSessionID, "hi"}
+		require.NoError(t, RunAgentsPrompt(config))
+
+		var got map[string]any
+		require.NoError(t, json.Unmarshal(stdout.Bytes(), &got))
+		assert.Equal(t, "I'll check the files first.\n\nThe answer is Paris.", got["text"])
+	})
+}
+
+// A script pasted into a tool call must not become a screen-wide progress line.
+func TestAgentsPromptCapsToolLineWidth(t *testing.T) {
+	withTestClient(t, func(config *CmdConfig, tm *tcMocks) {
+		_, stderr, _ := capturePrompt(t, config)
+		long := "node fetch.js " + strings.Repeat("https://example.com/page ", 20)
+		promptStream(t, tm, narratedRun(long))
+		expectSendInput(tm, "")
+
+		config.Args = []string{testPromptSessionID, "hi"}
+		require.NoError(t, RunAgentsPrompt(config))
+
+		for _, line := range strings.Split(stderr.String(), "\n") {
+			if strings.HasPrefix(line, "· node fetch.js") {
+				assert.LessOrEqual(t, len([]rune(line)), promptToolWidthPiped+2)
+				assert.True(t, strings.HasSuffix(line, "…"), "a cut line says it was cut: %q", line)
+				return
+			}
+		}
+		t.Fatalf("no tool line in %q", stderr.String())
 	})
 }
 

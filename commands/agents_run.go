@@ -966,7 +966,9 @@ type startupWords struct {
 
 var agentStartupWords = startupWords{
 	waiting: "Waiting for agent…",
-	ready:   "Agent is ready",
+	// READY means the sandbox is up; some agents still take seconds to accept
+	// their first turn, so this must not claim the agent itself is ready.
+	ready: "Session is ready",
 	hints: []string{
 		"Allocating sandbox…",
 		"Starting workspace…",
@@ -1176,7 +1178,7 @@ func printAutoCreatedConfigNotice(w io.Writer) {
 }
 
 // printRunReadySummary renders a compact session card after create/wait
-// succeeds. The lifecycle line already printed "✓ Agent is ready", so
+// succeeds. The lifecycle line already printed "✓ Session is ready", so
 // the card focuses on identity and next steps without repeating that headline.
 func printRunReadySummary(w io.Writer, sum runReadySummary) {
 	ref := displaySessionRef(sum.Session)

@@ -30,6 +30,7 @@ import (
 	"github.com/digitalocean/doctl/commands/displayers"
 	"github.com/digitalocean/doctl/do"
 	"github.com/digitalocean/godo"
+	"golang.org/x/term"
 )
 
 // promptStderr carries progress and diagnostics. c.Out is reserved for the
@@ -125,9 +126,13 @@ func RunAgentsPrompt(c *CmdConfig) error {
 		outcome:          outcome,
 		includeReasoning: includeReasoning,
 		quiet:            quiet,
+		toolWidth:        promptToolWidth(),
 		cursor:           &eventCursor{},
 		seen:             map[string]bool{},
 		resolved:         map[string]bool{},
+	}
+	if !agentStructuredOutput(c) {
+		col.out = c.Out
 	}
 
 	// Ctrl-C cancels the run and waits for it to end; a second Ctrl-C, a
@@ -216,6 +221,12 @@ type promptCollector struct {
 	outcome          godo.HostedAgentHITLOutcome
 	includeReasoning bool
 	quiet            bool
+	// toolWidth caps a tool-call progress line, in runes.
+	toolWidth int
+	// out receives the agent's text as each message ends, so a long run reads
+	// as it happens. Nil for structured output, which prints one envelope at
+	// the end.
+	out io.Writer
 
 	cursor *eventCursor
 	// seen guards against double-counting text: a reconnect replays from the
@@ -228,6 +239,17 @@ type promptCollector struct {
 	runID  string
 	answer strings.Builder
 	think  strings.Builder
+	// pending is the answer text not yet written to out; flushed records that
+	// some already was.
+	pending strings.Builder
+	flushed bool
+	// afterTool is set by a tool call and cleared by the next text, which
+	// starts a new message. The events carry no message boundary of their
+	// own, so a tool call in between is the only sign one message ended.
+	afterTool bool
+	// toolPrinted records a tool line on stderr, so the first message still
+	// gets a blank line above it.
+	toolPrinted bool
 
 	done    bool
 	status  string
@@ -375,14 +397,20 @@ func (p *promptCollector) handle(ev godo.HostedAgentEvent) (bool, error) {
 		if q.IsReasoning {
 			p.think.WriteString(q.Text)
 		} else {
-			p.answer.WriteString(q.Text)
+			p.addText(q.Text)
 		}
 
 	case godo.HostedAgentEventKindToolCallStarted:
+		p.flushMessage()
+		p.afterTool = true
 		var q toolCallStartedPayload
 		if err := json.Unmarshal(ev.Payload, &q); err == nil {
 			if line := q.commandLine(); line != "" {
+				if p.toolWidth > 1 {
+					line = truncateRunes(line, p.toolWidth)
+				}
 				p.progress(line)
+				p.toolPrinted = !p.quiet
 			}
 		}
 
@@ -465,6 +493,55 @@ func (p *promptCollector) resolveApproval(q hitlRequestedPayload) (bool, error) 
 	return false, nil
 }
 
+// promptToolWidthPiped caps tool lines when stderr is not a terminal: enough
+// for a command and its arguments, short of a script pasted inline.
+const promptToolWidthPiped = 160
+
+// promptToolWidth is the width a tool-call line may use: the terminal's, less
+// the "· " prefix, so each call stays on one row.
+func promptToolWidth() int {
+	if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w >= 40 {
+		return w - 2
+	}
+	return promptToolWidthPiped
+}
+
+// addText appends answer text, separating it from the previous message with a
+// blank line when a tool call came in between.
+func (p *promptCollector) addText(text string) {
+	if p.afterTool && strings.TrimSpace(text) != "" {
+		p.afterTool = false
+		if p.answer.Len() > 0 {
+			p.answer.WriteString("\n\n")
+		}
+	}
+	p.answer.WriteString(text)
+	p.pending.WriteString(text)
+}
+
+// flushMessage writes the message that just ended to out, so narration between
+// tool calls appears in order with them instead of all at once at the end.
+// stdout still receives exactly the answer text, one message per paragraph.
+func (p *promptCollector) flushMessage() {
+	if p.out == nil {
+		return
+	}
+	msg := strings.TrimSpace(p.pending.String())
+	p.pending.Reset()
+	if msg == "" {
+		return
+	}
+	switch {
+	case p.flushed:
+		fmt.Fprint(p.out, "\n")
+	case p.toolPrinted:
+		// stderr, not out: stdout must start with the answer when piped.
+		fmt.Fprint(promptStderr, "\n")
+	}
+	fmt.Fprintln(p.out, msg)
+	p.flushed = true
+}
+
 // progress writes one activity line to stderr, keeping stdout clean.
 func (p *promptCollector) progress(msg string) {
 	if p.quiet {
@@ -509,10 +586,20 @@ func (p *promptCollector) report(c *CmdConfig, ctx context.Context) error {
 		fmt.Fprintf(promptStderr, "%s\n", reasoning)
 	}
 
-	// The answer, then a newline only when the agent did not end with one. A
-	// trailing newline leaves the shell prompt on its own line and is stripped
-	// by `$(...)`, so it cannot corrupt a captured value.
+	// The rest of the answer, then a newline only when the agent did not end
+	// with one. A trailing newline leaves the shell prompt on its own line and
+	// is stripped by `$(...)`, so it cannot corrupt a captured value.
 	answer := p.answer.String()
+	if p.flushed {
+		answer = p.pending.String()
+		if strings.TrimSpace(answer) == "" {
+			answer = ""
+		} else {
+			answer = "\n" + strings.TrimLeft(answer, "\n")
+		}
+	} else if p.toolPrinted && p.out != nil && strings.TrimSpace(answer) != "" {
+		fmt.Fprint(promptStderr, "\n")
+	}
 	if _, err := io.WriteString(c.Out, answer); err != nil {
 		return err
 	}

@@ -55,6 +55,7 @@ import (
 	"github.com/digitalocean/doctl/internal/agentproxy/codex"
 	"github.com/digitalocean/doctl/internal/agentproxy/opencode"
 	"github.com/digitalocean/godo"
+	"github.com/kballard/go-shellquote"
 	"github.com/muesli/termenv"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
@@ -7712,7 +7713,7 @@ const workspaceRootPrefix = "/workspace/"
 
 // prettyCommandLabel reduces a raw tool command to what's worth reading: the
 // command itself rather than the shell that wrapped it, workspace-relative
-// paths, and a single line.
+// paths, heredoc bodies folded to a line count, and a single line.
 func prettyCommandLabel(cmd string) string {
 	cmd = strings.TrimSpace(cmd)
 	if wrapper := shellWrapperRE.FindString(cmd); wrapper != "" {
@@ -7721,39 +7722,80 @@ func prettyCommandLabel(cmd string) string {
 		}
 	}
 	cmd = strings.ReplaceAll(cmd, workspaceRootPrefix, "")
+	cmd = foldCommandLines(cmd)
 	return strings.TrimSpace(whitespaceRunRE.ReplaceAllString(cmd, " "))
 }
 
-// unquoteShellWord strips one layer of surrounding shell quoting and unescapes
-// the quote character inside it, so `"rg -n \"h1\" styles.css"` reads as
-// `rg -n "h1" styles.css`. Returns s unchanged unless it is a single fully
-// quoted word — several quoted words in a row ('a' 'b') are left alone, since
-// removing the outer pair there would change what the command says.
+// unquoteShellWord removes the shell quoting from s when s is exactly one
+// quoted shell word, so `"rg -n \"h1\" styles.css"` reads as
+// `rg -n "h1" styles.css`. That includes words built from several adjacent
+// quoted pieces, which is how agents keep a `$` literal inside a double-quoted
+// script: "sed -n '/a/,"'$p'"' f". Returns s unchanged otherwise: several words
+// in a row ('a' 'b') are left alone, since removing their quotes would change
+// what the command says.
 func unquoteShellWord(s string) string {
-	if len(s) < 2 {
+	if s == "" || (s[0] != '\'' && s[0] != '"') {
 		return s
 	}
-	quote := s[0]
-	if quote != '\'' && quote != '"' {
+	words, err := shellquote.Split(s)
+	if err != nil || len(words) != 1 {
 		return s
 	}
-	if s[len(s)-1] != quote {
-		return s
-	}
-	inner := s[1 : len(s)-1]
-	for i := 0; i < len(inner); i++ {
-		if quote == '"' && inner[i] == '\\' {
-			i++
+	return words[0]
+}
+
+// heredocStartRE finds a heredoc operator (<<EOF, <<-'EOF', << "EOF") and
+// captures its delimiter; the leading class keeps a here-string (<<<) out.
+var heredocStartRE = regexp.MustCompile(`(?:^|[^<])<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+
+// foldCommandLines turns a multi-line script into one line a reader can scan:
+// each heredoc body becomes "[N lines]", a backslash continuation joins its
+// line to the next, and the remaining lines are joined with "; ", or with a
+// space after a line that cannot end a command (`&&`, `|`, `then`, ...).
+// Without the fold, a script that writes a file through a heredoc renders the
+// whole file inline and buries the command that runs it.
+func foldCommandLines(cmd string) string {
+	lines := strings.Split(cmd, "\n")
+	var out strings.Builder
+	joinSpace := true
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
 			continue
 		}
-		if inner[i] == quote {
-			return s
+		if m := heredocStartRE.FindStringSubmatch(line); m != nil {
+			body := 0
+			for i+1 < len(lines) && strings.TrimSpace(lines[i+1]) != m[1] {
+				i++
+				body++
+			}
+			i++ // the delimiter line
+			line += fmt.Sprintf(" [%d lines]", body)
+		}
+		if out.Len() > 0 {
+			if joinSpace {
+				out.WriteString(" ")
+			} else {
+				out.WriteString("; ")
+			}
+		}
+		continued := strings.HasSuffix(line, `\`)
+		line = strings.TrimSpace(strings.TrimSuffix(line, `\`))
+		out.WriteString(line)
+		joinSpace = continued || commandContinues(line)
+	}
+	return out.String()
+}
+
+// commandContinues reports whether a line ends in a way that makes the next
+// line part of the same command, where joining with "; " would misquote it.
+func commandContinues(line string) bool {
+	for _, suffix := range []string{"&&", "||", "|", "{", "(", " then", " do", " else"} {
+		if strings.HasSuffix(line, suffix) {
+			return true
 		}
 	}
-	if quote == '"' {
-		inner = strings.ReplaceAll(inner, `\"`, `"`)
-	}
-	return inner
+	return line == "then" || line == "do" || line == "else"
 }
 
 type toolCallCompletedPayload struct {

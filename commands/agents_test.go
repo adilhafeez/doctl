@@ -302,7 +302,7 @@ func TestCreateNeverAttaches(t *testing.T) {
 
 		require.NoError(t, RunAgentsCreate(config))
 		out := buf.String()
-		assert.Contains(t, out, "Agent is ready")
+		assert.Contains(t, out, "Session is ready")
 		assert.Contains(t, out, "doctl harness-runtime launch demo",
 			"the ready card should point at launch, the command that attaches")
 		assert.Contains(t, out, autoCreatedConfigNotice,
@@ -351,7 +351,7 @@ func TestRunAgentsCreate_JSONHonoursPrompt(t *testing.T) {
 		config.Doit.Set(config.NS, doctl.ArgAgentTriggerPrompt, "classify this")
 
 		require.NoError(t, RunAgentsCreate(config))
-		assert.NotContains(t, buf.String(), "Agent is ready", "json stdout must stay parseable")
+		assert.NotContains(t, buf.String(), "Session is ready", "json stdout must stay parseable")
 		assert.Contains(t, buf.String(), "sess_json_prompt")
 	})
 }
@@ -5771,7 +5771,15 @@ func TestPrettyCommandLabel(t *testing.T) {
 		{"handles zsh -ic", `/usr/bin/zsh -ic 'echo hi'`, "echo hi"},
 		{"drops workspace prefix", `/bin/bash -lc "sed -n '1,9p' /workspace/.agents/skills/x/SKILL.md"`, `sed -n '1,9p' .agents/skills/x/SKILL.md`},
 		{"keeps bare workspace", `/bin/bash -lc 'ls -la /workspace'`, "ls -la /workspace"},
-		{"collapses newlines", "echo one\n\necho two", "echo one echo two"},
+		{"joins separate lines as separate commands", "echo one\n\necho two", "echo one; echo two"},
+		{"joins a pipeline split across lines with a space", "ls |\nwc -l", "ls | wc -l"},
+		{"joins backslash continuations", "node fetch.js \\\n  https://a \\\n  https://b", "node fetch.js https://a https://b"},
+		{"folds a heredoc body to its line count",
+			"/bin/bash -lc \"cd /workspace && cat > fetch.js <<'EOF'\nconst a = 1;\nconsole.log(a);\nEOF\nnode fetch.js https://example.com\"",
+			"cd /workspace && cat > fetch.js <<'EOF' [2 lines]; node fetch.js https://example.com"},
+		{"keeps a here-string inline", "cat <<< hello\necho done", "cat <<< hello; echo done"},
+		{"unquotes adjacent quoted pieces", `/bin/bash -lc "sed -n '/Latest/,"'$p'"' index.txt"`, `sed -n '/Latest/,$p' index.txt`},
+		{"unescapes backslashes inside double quotes", `/bin/bash -lc "grep -E 'a\\s+b' x"`, `grep -E 'a\s+b' x`},
 		{"leaves several quoted words alone", `/bin/bash -lc 'a' 'b'`, `'a' 'b'`},
 		{"tolerates missing command after wrapper", "/bin/bash -lc", "/bin/bash -lc"},
 	}
